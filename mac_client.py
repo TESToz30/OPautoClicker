@@ -2,6 +2,7 @@
 Mac Remote Control Client
 =========================
 Runs on your Mac. Polls the server for commands and streams screenshots.
+Can ONLY be stopped via the Disconnect button on the dashboard.
 
 USAGE:
   python3 mac_client.py <client-name>
@@ -9,7 +10,6 @@ USAGE:
 EXAMPLES:
   python3 mac_client.py gaming-pc
   python3 mac_client.py laptop
-  python3 mac_client.py work-mac
 
 SETUP:
   pip3 install pyautogui Pillow requests
@@ -24,35 +24,41 @@ import io
 import subprocess
 import sys
 import threading
+import signal
+import os
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
 SERVER_URL = "https://remote-control-3gj9.onrender.com"
 API_KEY = "key4api321"
 
-POLL_INTERVAL = 1.0        # seconds between command polls
-SCREENSHOT_INTERVAL = 0.5  # seconds between screenshot uploads (~2fps)
-SCREENSHOT_QUALITY = 45    # lower = smaller file, faster upload
+POLL_INTERVAL = 1.0
+SCREENSHOT_INTERVAL = 0.5
+SCREENSHOT_QUALITY = 45
 
 # ──────────────────────────────────────────────────────────────────────────────
 
 pyautogui.FAILSAFE = False
 pyautogui.PAUSE = 0.05
 
+# Block Ctrl+C — only dashboard can disconnect
+signal.signal(signal.SIGINT, lambda s, f: print("\n  [blocked] Use the Disconnect button on the dashboard to stop."))
+signal.signal(signal.SIGTERM, lambda s, f: None)
+
+running = True
+
 def get_client_name():
     if len(sys.argv) > 1:
         return sys.argv[1]
     name = input("Enter a name for this machine (e.g. gaming-pc): ").strip()
-    if not name:
-        name = "my-mac"
-    return name
+    return name or "my-mac"
 
 CLIENT_NAME = get_client_name()
 HEADERS = {"X-API-Key": API_KEY, "Content-Type": "application/json"}
 
 def take_screenshot_b64():
     img = pyautogui.screenshot()
-    img = img.convert("RGB")  # strip alpha channel so JPEG works
+    img = img.convert("RGB")
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=SCREENSHOT_QUALITY, optimize=True)
     return base64.b64encode(buf.getvalue()).decode()
@@ -60,9 +66,18 @@ def take_screenshot_b64():
 def upload_screenshot():
     try:
         img_b64 = take_screenshot_b64()
+        mx, my = pyautogui.position()
+        sw, sh = pyautogui.size()
         requests.post(
             f"{SERVER_URL}/api/screenshot",
-            json={"client": CLIENT_NAME, "image": img_b64},
+            json={
+                "client": CLIENT_NAME,
+                "image": img_b64,
+                "mouse_x": mx,
+                "mouse_y": my,
+                "screen_w": sw,
+                "screen_h": sh,
+            },
             headers=HEADERS,
             timeout=8
         )
@@ -70,11 +85,16 @@ def upload_screenshot():
         print(f"  [screen] {e}")
 
 def execute_command(cmd):
+    global running
     t = cmd.get("type")
     args = cmd.get("args", {})
     print(f"  ▶ {t} {args}")
     try:
-        if t == "click":
+        if t == "shutdown":
+            print("\n  Disconnecting as requested from dashboard...")
+            running = False
+            os._exit(0)
+        elif t == "click":
             pyautogui.click(int(args["x"]), int(args["y"]))
         elif t == "rclick":
             pyautogui.rightClick(int(args["x"]), int(args["y"]))
@@ -103,14 +123,12 @@ def execute_command(cmd):
         print(f"  Error: {e}")
 
 def screenshot_loop():
-    """Continuously uploads screenshots in background."""
-    while True:
+    while running:
         upload_screenshot()
         time.sleep(SCREENSHOT_INTERVAL)
 
 def poll_loop():
-    """Polls for commands."""
-    while True:
+    while running:
         try:
             r = requests.get(
                 f"{SERVER_URL}/api/poll",
@@ -133,14 +151,10 @@ def main():
     print(f"\n✅ Remote control client started")
     print(f"   Name   : {CLIENT_NAME}")
     print(f"   Server : {SERVER_URL}")
-    print(f"   Screen : ~{1/SCREENSHOT_INTERVAL:.0f}fps upload")
-    print(f"   Press Ctrl+C to stop\n")
+    print(f"   To stop: use Disconnect button on dashboard\n")
 
-    # Run screenshot upload in background thread
     t = threading.Thread(target=screenshot_loop, daemon=True)
     t.start()
-
-    # Run command polling in main thread
     poll_loop()
 
 if __name__ == "__main__":
