@@ -26,6 +26,7 @@ import sys
 import threading
 import signal
 import os
+from PIL import Image
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
@@ -33,8 +34,9 @@ SERVER_URL = "https://remote-control-3gj9.onrender.com"
 API_KEY = "key4api321"
 
 POLL_INTERVAL = 1.0
-SCREENSHOT_INTERVAL = 0.5
-SCREENSHOT_QUALITY = 45
+SCREENSHOT_INTERVAL = 0.2  # ~5fps
+SCREENSHOT_QUALITY = 50
+SCREENSHOT_HEIGHT = 420     # scale to 420p, width auto
 
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -59,6 +61,10 @@ HEADERS = {"X-API-Key": API_KEY, "Content-Type": "application/json"}
 def take_screenshot_b64():
     img = pyautogui.screenshot()
     img = img.convert("RGB")
+    # Scale to 420p keeping aspect ratio
+    w, h = img.size
+    new_w = int(w * SCREENSHOT_HEIGHT / h)
+    img = img.resize((new_w, SCREENSHOT_HEIGHT), Image.BILINEAR)
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=SCREENSHOT_QUALITY, optimize=True)
     return base64.b64encode(buf.getvalue()).decode()
